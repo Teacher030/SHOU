@@ -1,0 +1,364 @@
+/**
+  ******************************************************************************
+  * @file    oled.c
+  * @brief   0.96寸 7针 SPI OLED (SSD1306) 驱动实现
+  * @note    基于 HAL 库, 使用 SPI2, 内部维护 128x64 帧缓冲
+  ******************************************************************************
+  */
+#include "oled.h"
+#include "spi.h"
+
+/* ============================ 引脚控制 ============================ */
+#define OLED_CS_Low()    HAL_GPIO_WritePin(OLED_CS_GPIO_Port,  OLED_CS_Pin,  GPIO_PIN_RESET)
+#define OLED_CS_High()   HAL_GPIO_WritePin(OLED_CS_GPIO_Port,  OLED_CS_Pin,  GPIO_PIN_SET)
+#define OLED_DC_Low()    HAL_GPIO_WritePin(OLED_DC_GPIO_Port,  OLED_DC_Pin,  GPIO_PIN_RESET)
+#define OLED_DC_High()   HAL_GPIO_WritePin(OLED_DC_GPIO_Port,  OLED_DC_Pin,  GPIO_PIN_SET)
+#define OLED_RES_Low()   HAL_GPIO_WritePin(OLED_RES_GPIO_Port, OLED_RES_Pin, GPIO_PIN_RESET)
+#define OLED_RES_High()  HAL_GPIO_WritePin(OLED_RES_GPIO_Port, OLED_RES_Pin, GPIO_PIN_SET)
+
+/* ============================ 帧缓冲 ============================ */
+/* 页式组织: buffer[page * 128 + column], 每页 8 行, bit0 为页内最上一行 */
+static uint8_t s_framebuffer[OLED_WIDTH * OLED_PAGES];
+
+/* ============================ 6x8 ASCII 字库 ============================ */
+/* 取模方式: 逐列式(纵向 8 点, 高位在下), ASCII 0x20 ~ 0x7E */
+static const uint8_t s_font6x8[][6] =
+{
+    {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, /* ' ' */
+    {0x00, 0x00, 0x00, 0x2F, 0x00, 0x00}, /* '!' */
+    {0x00, 0x00, 0x07, 0x00, 0x07, 0x00}, /* '"' */
+    {0x00, 0x14, 0x7F, 0x14, 0x7F, 0x14}, /* '#' */
+    {0x00, 0x24, 0x2A, 0x7F, 0x2A, 0x12}, /* '$' */
+    {0x00, 0x62, 0x64, 0x08, 0x13, 0x23}, /* '%' */
+    {0x00, 0x36, 0x49, 0x55, 0x22, 0x50}, /* '&' */
+    {0x00, 0x00, 0x05, 0x03, 0x00, 0x00}, /* ''' */
+    {0x00, 0x00, 0x1C, 0x22, 0x41, 0x00}, /* '(' */
+    {0x00, 0x00, 0x41, 0x22, 0x1C, 0x00}, /* ')' */
+    {0x00, 0x14, 0x08, 0x3E, 0x08, 0x14}, /* '*' */
+    {0x00, 0x08, 0x08, 0x3E, 0x08, 0x08}, /* '+' */
+    {0x00, 0x00, 0x50, 0x30, 0x00, 0x00}, /* ',' */
+    {0x00, 0x08, 0x08, 0x08, 0x08, 0x08}, /* '-' */
+    {0x00, 0x00, 0x60, 0x60, 0x00, 0x00}, /* '.' */
+    {0x00, 0x20, 0x10, 0x08, 0x04, 0x02}, /* '/' */
+    {0x00, 0x3E, 0x51, 0x49, 0x45, 0x3E}, /* '0' */
+    {0x00, 0x00, 0x42, 0x7F, 0x40, 0x00}, /* '1' */
+    {0x00, 0x42, 0x61, 0x51, 0x49, 0x46}, /* '2' */
+    {0x00, 0x21, 0x41, 0x45, 0x4B, 0x31}, /* '3' */
+    {0x00, 0x18, 0x14, 0x12, 0x7F, 0x10}, /* '4' */
+    {0x00, 0x27, 0x45, 0x45, 0x45, 0x39}, /* '5' */
+    {0x00, 0x3C, 0x4A, 0x49, 0x49, 0x30}, /* '6' */
+    {0x00, 0x01, 0x71, 0x09, 0x05, 0x03}, /* '7' */
+    {0x00, 0x36, 0x49, 0x49, 0x49, 0x36}, /* '8' */
+    {0x00, 0x06, 0x49, 0x49, 0x29, 0x1E}, /* '9' */
+    {0x00, 0x00, 0x36, 0x36, 0x00, 0x00}, /* ':' */
+    {0x00, 0x00, 0x56, 0x36, 0x00, 0x00}, /* ';' */
+    {0x00, 0x08, 0x14, 0x22, 0x41, 0x00}, /* '<' */
+    {0x00, 0x14, 0x14, 0x14, 0x14, 0x14}, /* '=' */
+    {0x00, 0x00, 0x41, 0x22, 0x14, 0x08}, /* '>' */
+    {0x00, 0x02, 0x01, 0x51, 0x09, 0x06}, /* '?' */
+    {0x00, 0x32, 0x49, 0x79, 0x41, 0x3E}, /* '@' */
+    {0x00, 0x7E, 0x11, 0x11, 0x11, 0x7E}, /* 'A' */
+    {0x00, 0x7F, 0x49, 0x49, 0x49, 0x36}, /* 'B' */
+    {0x00, 0x3E, 0x41, 0x41, 0x41, 0x22}, /* 'C' */
+    {0x00, 0x7F, 0x41, 0x41, 0x22, 0x1C}, /* 'D' */
+    {0x00, 0x7F, 0x49, 0x49, 0x49, 0x41}, /* 'E' */
+    {0x00, 0x7F, 0x09, 0x09, 0x09, 0x01}, /* 'F' */
+    {0x00, 0x3E, 0x41, 0x49, 0x49, 0x7A}, /* 'G' */
+    {0x00, 0x7F, 0x08, 0x08, 0x08, 0x7F}, /* 'H' */
+    {0x00, 0x00, 0x41, 0x7F, 0x41, 0x00}, /* 'I' */
+    {0x00, 0x20, 0x40, 0x41, 0x3F, 0x01}, /* 'J' */
+    {0x00, 0x7F, 0x08, 0x14, 0x22, 0x41}, /* 'K' */
+    {0x00, 0x7F, 0x40, 0x40, 0x40, 0x40}, /* 'L' */
+    {0x00, 0x7F, 0x02, 0x0C, 0x02, 0x7F}, /* 'M' */
+    {0x00, 0x7F, 0x04, 0x08, 0x10, 0x7F}, /* 'N' */
+    {0x00, 0x3E, 0x41, 0x41, 0x41, 0x3E}, /* 'O' */
+    {0x00, 0x7F, 0x09, 0x09, 0x09, 0x06}, /* 'P' */
+    {0x00, 0x3E, 0x41, 0x51, 0x21, 0x5E}, /* 'Q' */
+    {0x00, 0x7F, 0x09, 0x19, 0x29, 0x46}, /* 'R' */
+    {0x00, 0x46, 0x49, 0x49, 0x49, 0x31}, /* 'S' */
+    {0x00, 0x01, 0x01, 0x7F, 0x01, 0x01}, /* 'T' */
+    {0x00, 0x3F, 0x40, 0x40, 0x40, 0x3F}, /* 'U' */
+    {0x00, 0x1F, 0x20, 0x40, 0x20, 0x1F}, /* 'V' */
+    {0x00, 0x3F, 0x40, 0x38, 0x40, 0x3F}, /* 'W' */
+    {0x00, 0x63, 0x14, 0x08, 0x14, 0x63}, /* 'X' */
+    {0x00, 0x07, 0x08, 0x70, 0x08, 0x07}, /* 'Y' */
+    {0x00, 0x61, 0x51, 0x49, 0x45, 0x43}, /* 'Z' */
+    {0x00, 0x00, 0x7F, 0x41, 0x41, 0x00}, /* '[' */
+    {0x00, 0x02, 0x04, 0x08, 0x10, 0x20}, /* '\' */
+    {0x00, 0x00, 0x41, 0x41, 0x7F, 0x00}, /* ']' */
+    {0x00, 0x04, 0x02, 0x01, 0x02, 0x04}, /* '^' */
+    {0x00, 0x40, 0x40, 0x40, 0x40, 0x40}, /* '_' */
+    {0x00, 0x00, 0x01, 0x02, 0x04, 0x00}, /* '`' */
+    {0x00, 0x20, 0x54, 0x54, 0x54, 0x78}, /* 'a' */
+    {0x00, 0x7F, 0x48, 0x44, 0x44, 0x38}, /* 'b' */
+    {0x00, 0x38, 0x44, 0x44, 0x44, 0x20}, /* 'c' */
+    {0x00, 0x38, 0x44, 0x44, 0x48, 0x7F}, /* 'd' */
+    {0x00, 0x38, 0x54, 0x54, 0x54, 0x18}, /* 'e' */
+    {0x00, 0x08, 0x7E, 0x09, 0x01, 0x02}, /* 'f' */
+    {0x00, 0x0C, 0x52, 0x52, 0x52, 0x3E}, /* 'g' */
+    {0x00, 0x7F, 0x08, 0x04, 0x04, 0x78}, /* 'h' */
+    {0x00, 0x00, 0x44, 0x7D, 0x40, 0x00}, /* 'i' */
+    {0x00, 0x20, 0x40, 0x44, 0x3D, 0x00}, /* 'j' */
+    {0x00, 0x7F, 0x10, 0x28, 0x44, 0x00}, /* 'k' */
+    {0x00, 0x00, 0x41, 0x7F, 0x40, 0x00}, /* 'l' */
+    {0x00, 0x7C, 0x04, 0x18, 0x04, 0x78}, /* 'm' */
+    {0x00, 0x7C, 0x08, 0x04, 0x04, 0x78}, /* 'n' */
+    {0x00, 0x38, 0x44, 0x44, 0x44, 0x38}, /* 'o' */
+    {0x00, 0x7C, 0x14, 0x14, 0x14, 0x08}, /* 'p' */
+    {0x00, 0x08, 0x14, 0x14, 0x18, 0x7C}, /* 'q' */
+    {0x00, 0x7C, 0x08, 0x04, 0x04, 0x08}, /* 'r' */
+    {0x00, 0x48, 0x54, 0x54, 0x54, 0x20}, /* 's' */
+    {0x00, 0x04, 0x3F, 0x44, 0x40, 0x20}, /* 't' */
+    {0x00, 0x3C, 0x40, 0x40, 0x20, 0x7C}, /* 'u' */
+    {0x00, 0x1C, 0x20, 0x40, 0x20, 0x1C}, /* 'v' */
+    {0x00, 0x3C, 0x40, 0x30, 0x40, 0x3C}, /* 'w' */
+    {0x00, 0x44, 0x28, 0x10, 0x28, 0x44}, /* 'x' */
+    {0x00, 0x0C, 0x50, 0x50, 0x50, 0x3C}, /* 'y' */
+    {0x00, 0x44, 0x64, 0x54, 0x4C, 0x44}, /* 'z' */
+    {0x00, 0x00, 0x08, 0x36, 0x41, 0x00}, /* '{' */
+    {0x00, 0x00, 0x00, 0x7F, 0x00, 0x00}, /* '|' */
+    {0x00, 0x00, 0x41, 0x36, 0x08, 0x00}, /* '}' */
+    {0x00, 0x08, 0x08, 0x2A, 0x1C, 0x08}, /* '~' */
+};
+
+/* ============================ 底层 SPI 收发 ============================ */
+static void OLED_WriteCmd(uint8_t cmd)
+{
+    OLED_DC_Low();
+    OLED_CS_Low();
+    HAL_SPI_Transmit(&hspi2, &cmd, 1, 100);
+    OLED_CS_High();
+}
+
+static void OLED_WriteDataBuf(const uint8_t *pBuf, uint16_t len)
+{
+    OLED_DC_High();
+    OLED_CS_Low();
+    HAL_SPI_Transmit(&hspi2, (uint8_t *)pBuf, len, 1000);
+    OLED_CS_High();
+}
+
+/* ============================ 初始化 ============================ */
+void OLED_Init(void)
+{
+    /* 硬件复位 */
+    OLED_CS_High();
+    OLED_DC_Low();
+    OLED_RES_Low();
+    HAL_Delay(50);
+    OLED_RES_High();
+    HAL_Delay(50);
+
+    /* SSD1306 初始化序列 */
+    OLED_WriteCmd(0xAE);            /* 关闭显示 */
+    OLED_WriteCmd(0x20);            /* 设置内存寻址模式 */
+    OLED_WriteCmd(0x00);            /* 00: 水平寻址模式 */
+    OLED_WriteCmd(0xB0);            /* 设置页起始地址 0 */
+    OLED_WriteCmd(0xC8);            /* COM 扫描方向重映射 */
+    OLED_WriteCmd(0x00);            /* 列起始地址低 4 位 */
+    OLED_WriteCmd(0x10);            /* 列起始地址高 4 位 */
+    OLED_WriteCmd(0x40);            /* 显示起始行 0 */
+    OLED_WriteCmd(0x81);            /* 对比度控制 */
+    OLED_WriteCmd(0xCF);            /* 对比度 207 */
+    OLED_WriteCmd(0xA1);            /* 段重映射 */
+    OLED_WriteCmd(0xA6);            /* 正常显示(非反色) */
+    OLED_WriteCmd(0xA8);            /* 多路复用比 */
+    OLED_WriteCmd(0x3F);            /* 1/64 */
+    OLED_WriteCmd(0xA4);            /* 从 RAM 内容恢复显示 */
+    OLED_WriteCmd(0xD3);            /* 显示偏移 */
+    OLED_WriteCmd(0x00);            /* 偏移 0 */
+    OLED_WriteCmd(0xD5);            /* 显示时钟分频/振荡频率 */
+    OLED_WriteCmd(0x80);            /* 默认 */
+    OLED_WriteCmd(0xD9);            /* 预充电周期 */
+    OLED_WriteCmd(0xF1);            /* Phase1=1, Phase2=15 */
+    OLED_WriteCmd(0xDA);            /* COM 引脚配置 */
+    OLED_WriteCmd(0x12);            /* 顺序/禁用左右重映射 */
+    OLED_WriteCmd(0xDB);            /* VCOMH 电平 */
+    OLED_WriteCmd(0x40);            /* ~0.77*VCC */
+    OLED_WriteCmd(0x8D);            /* 电荷泵设置 */
+    OLED_WriteCmd(0x14);            /* 使能内部电荷泵 */
+    OLED_WriteCmd(0xAF);            /* 打开显示 */
+
+    OLED_Clear();
+    OLED_Refresh();
+}
+
+/* ============================ 基本绘制 ============================ */
+void OLED_DrawPixel(uint8_t x, uint8_t y, uint8_t color)
+{
+    if (x >= OLED_WIDTH || y >= OLED_HEIGHT)
+    {
+        return;
+    }
+
+    if (color)
+    {
+        s_framebuffer[x + (y / 8) * OLED_WIDTH] |= (uint8_t)(1u << (y % 8));
+    }
+    else
+    {
+        s_framebuffer[x + (y / 8) * OLED_WIDTH] &= (uint8_t)~(1u << (y % 8));
+    }
+}
+
+void OLED_Clear(void)
+{
+    uint16_t i;
+    for (i = 0; i < sizeof(s_framebuffer); i++)
+    {
+        s_framebuffer[i] = 0x00;
+    }
+}
+
+void OLED_Refresh(void)
+{
+    OLED_WriteCmd(0x21);            /* 设置列地址范围 */
+    OLED_WriteCmd(0x00);            /* 起始列 0 */
+    OLED_WriteCmd(0x7F);            /* 结束列 127 */
+    OLED_WriteCmd(0x22);            /* 设置页地址范围 */
+    OLED_WriteCmd(0x00);            /* 起始页 0 */
+    OLED_WriteCmd(0x07);            /* 结束页 7 */
+    OLED_WriteDataBuf(s_framebuffer, sizeof(s_framebuffer));
+}
+
+/* ============================ 文本绘制 ============================ */
+void OLED_DrawChar(uint8_t x, uint8_t y, char ch, uint8_t color)
+{
+    uint8_t i, j;
+    const uint8_t *pCol;
+
+    if (x > (OLED_WIDTH - 6) || y > (OLED_HEIGHT - 8))
+    {
+        return;
+    }
+
+    if (ch < 0x20 || ch > 0x7E)
+    {
+        ch = ' ';
+    }
+    pCol = s_font6x8[ch - 0x20];
+
+    for (i = 0; i < 6; i++)
+    {
+        for (j = 0; j < 8; j++)
+        {
+            if (pCol[i] & (1u << j))
+            {
+                OLED_DrawPixel(x + i, y + j, color);
+            }
+        }
+    }
+}
+
+void OLED_ShowString(uint8_t x, uint8_t y, const char *str, uint8_t color)
+{
+    while (*str != '\0')
+    {
+        OLED_DrawChar(x, y, *str++, color);
+        x += 6;
+        if (x > (OLED_WIDTH - 6))
+        {
+            break;
+        }
+    }
+}
+
+/* 带符号整数显示, width 为总字符宽度(含负号), 右对齐 */
+void OLED_ShowInt(uint8_t x, uint8_t y, int32_t num, uint8_t width, uint8_t color)
+{
+    char buf[12];
+    uint8_t len = 0;
+    uint8_t neg = 0;
+    uint8_t i;
+
+    if (width > 11)
+    {
+        width = 11;
+    }
+
+    if (num < 0)
+    {
+        neg = 1;
+        num = -num;
+    }
+
+    do
+    {
+        buf[len++] = (char)('0' + (num % 10));
+        num /= 10;
+    } while (num > 0 && len < 11);
+
+    {
+        uint8_t total = (uint8_t)(len + neg);
+        uint8_t digits = total;
+        if (width > digits)
+        {
+            digits = width;
+        }
+        x += (uint8_t)((digits - total) * 6);   /* 左补空格实现右对齐 */
+    }
+
+    if (neg)
+    {
+        OLED_DrawChar(x, y, '-', color);
+        x += 6;
+    }
+
+    for (i = 0; i < len; i++)
+    {
+        OLED_DrawChar(x, y, buf[len - 1 - i], color);
+        x += 6;
+    }
+}
+
+/* 带符号浮点显示, 保留 1 位小数 */
+void OLED_ShowFloat(uint8_t x, uint8_t y, float val, uint8_t color)
+{
+    char buf[16];
+    int32_t scaled;
+    int32_t intPart, fracPart;
+    uint8_t neg = 0;
+    uint8_t n = 0;
+    uint8_t i;
+
+    if (val < 0)
+    {
+        neg = 1;
+        val = -val;
+    }
+    scaled = (int32_t)(val * 10.0f + 0.5f);
+    intPart = scaled / 10;
+    fracPart = scaled % 10;
+
+    if (neg)
+    {
+        buf[n++] = '-';
+    }
+
+    {
+        char tmp[8];
+        uint8_t m = 0;
+        if (intPart == 0)
+        {
+            tmp[m++] = '0';
+        }
+        else
+        {
+            while (intPart > 0 && m < 7)
+            {
+                tmp[m++] = (char)('0' + (intPart % 10));
+                intPart /= 10;
+            }
+        }
+        for (i = 0; i < m; i++)
+        {
+            buf[n++] = tmp[m - 1 - i];
+        }
+    }
+
+    buf[n++] = '.';
+    buf[n++] = (char)('0' + fracPart);
+    buf[n] = '\0';
+
+    OLED_ShowString(x, y, buf, color);
+}
